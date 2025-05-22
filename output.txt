@@ -1,0 +1,514 @@
+
+===== .\main_deploy.py =====
+import os
+import numpy as np
+import librosa
+import torch
+import torch.nn as nn
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import io
+import soundfile as sf
+
+# --- Training Flag ---
+IS_TRAINING = False  
+
+# --- FastAPI App ---
+app = FastAPI(title="Phân Loại Âm Thanh Deepfake", description="API và giao diện phân loại âm thanh thật/giả")
+
+# --- Mount static files và templates ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# --- Config ---
+SR = 16000
+N_FFT = 2048
+HOP_LENGTH = 512
+N_MELS = 128
+MAX_FRAMES_SPEC = 313
+FMIN = 0.0
+FMAX = None
+NORM_EPSILON = 1e-6
+DEVICE = torch.device("cpu") 
+VIT_PATCH_SIZE = 16
+VIT_EMBED_DIM = 192
+VIT_DEPTH = 6
+VIT_NUM_HEADS = 6
+VIT_MLP_RATIO = 4.0
+VIT_DROP_RATE = 0.1
+VIT_ATTN_DROP_RATE = 0.1
+CNN_DROPOUT_RATE = 0.4
+MODEL_PATH_VIT = "best_vit_model_pytorch.pth"
+MODEL_PATH_CNN = "best_cnn_model_pytorch.pth"
+
+# --- Định Nghĩa Mô Hình ViT (từ code Kaggle) ---
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, embed_dim=768):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = (img_size[0] // patch_size, img_size[1] // patch_size)
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert H == self.img_size[0] and W == self.img_size[1], \
+            f"Kích thước ảnh đầu vào ({H}*{W}) không khớp với mô hình ({self.img_size[0]}*{self.img_size[1]})."
+        x = self.proj(x)
+        x = x.flatten(2)
+        x = x.transpose(1, 2)
+        return x
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class VisionTransformer(nn.Module):
+    def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, num_classes=1,
+                 embed_dim=192, depth=6, num_heads=6, mlp_ratio=4., qkv_bias=True,
+                 drop_rate=0.1, attn_drop_rate=0.1):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_features = self.embed_dim = embed_dim
+        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.blocks = nn.ModuleList([
+            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+                  drop=drop_rate, attn_drop=attn_drop_rate)
+            for i in range(depth)])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+        nn.init.trunc_normal_(self.pos_embed, std=.02)
+        nn.init.trunc_normal_(self.cls_token, std=.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        return x[:, 0]
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x
+
+# --- Định Nghĩa Mô Hình CNN (từ code Kaggle) ---
+class AudioCNN(nn.Module):
+    def __init__(self, num_classes=1, dropout_rate=0.4):
+        super(AudioCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.pool1 = nn.MaxPool2d(kernel_size=2)
+        self.drop1 = nn.Dropout2d(dropout_rate/2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.pool2 = nn.MaxPool2d(kernel_size=2)
+        self.drop2 = nn.Dropout2d(dropout_rate/2)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool3 = nn.MaxPool2d(kernel_size=2)
+        self.drop3 = nn.Dropout2d(dropout_rate)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.pool4 = nn.MaxPool2d(kernel_size=2)
+        self.drop4 = nn.Dropout2d(dropout_rate)
+        height_after_convs = N_MELS // (2**4)
+        width_after_convs = MAX_FRAMES_SPEC // (2**4)
+        self.fc1 = nn.Linear(256 * height_after_convs * width_after_convs, 512)
+        self.bn_fc1 = nn.BatchNorm1d(512)
+        self.drop_fc1 = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(512, 128)
+        self.bn_fc2 = nn.BatchNorm1d(128)
+        self.drop_fc2 = nn.Dropout(dropout_rate)
+        self.fc3 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = nn.functional.relu(self.bn1(self.conv1(x)))
+        x = self.pool1(x)
+        x = self.drop1(x)
+        x = nn.functional.relu(self.bn2(self.conv2(x)))
+        x = self.pool2(x)
+        x = self.drop2(x)
+        x = nn.functional.relu(self.bn3(self.conv3(x)))
+        x = self.pool3(x)
+        x = self.drop3(x)
+        x = nn.functional.relu(self.bn4(self.conv4(x)))
+        x = self.pool4(x)
+        x = self.drop4(x)
+        x = x.view(x.size(0), -1)
+        x = nn.functional.relu(self.bn_fc1(self.fc1(x)))
+        x = self.drop_fc1(x)
+        x = nn.functional.relu(self.bn_fc2(self.fc2(x)))
+        x = self.drop_fc2(x)
+        x = self.fc3(x)
+        return x
+
+# --- Hàm Tiền Xử Lý Âm Thanh (từ code Kaggle) ---
+def audio_to_melspectrogram(audio_data, sr=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, max_frames=MAX_FRAMES_SPEC, fmin=FMIN, fmax=FMAX):
+    try:
+        y, sr_orig = sf.read(io.BytesIO(audio_data))
+        if sr_orig != sr:
+            y = librosa.resample(y, orig_sr=sr_orig, target_sr=sr)
+        mel_spectrogram = librosa.feature.melspectrogram(
+            y=y, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, fmin=fmin, fmax=fmax if fmax is not None else sr/2
+        )
+        log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
+        current_frames = log_mel_spectrogram.shape[1]
+        if current_frames < max_frames:
+            pad_value = log_mel_spectrogram.min()
+            pad_width = max_frames - current_frames
+            padded_log_mel_spectrogram = np.pad(
+                log_mel_spectrogram, ((0, 0), (0, pad_width)), mode='constant', constant_values=pad_value
+            )
+            return padded_log_mel_spectrogram
+        elif current_frames > max_frames:
+            truncated_log_mel_spectrogram = log_mel_spectrogram[:, :max_frames]
+            return truncated_log_mel_spectrogram
+        else:
+            return log_mel_spectrogram
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi xử lý âm thanh: {str(e)}")
+
+# --- Tải Mô Hình ---
+def load_model(model_class, model_path):
+    try:
+        model = model_class().to(DEVICE)
+        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        model.eval()
+        return model
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi tải mô hình: {str(e)}")
+
+# --- Chỉ Load Mô Hình Khi Không Huấn Luyện ---
+if not IS_TRAINING:
+    # Tải mô hình ViT và CNN
+    vit_model = load_model(
+        lambda: VisionTransformer(
+            img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=VIT_PATCH_SIZE, in_chans=3, num_classes=1,
+            embed_dim=VIT_EMBED_DIM, depth=VIT_DEPTH, num_heads=VIT_NUM_HEADS, mlp_ratio=VIT_MLP_RATIO,
+            qkv_bias=True, drop_rate=VIT_DROP_RATE, attn_drop_rate=VIT_ATTN_DROP_RATE
+        ),
+        MODEL_PATH_VIT
+    )
+    cnn_model = load_model(
+        lambda: AudioCNN(num_classes=1, dropout_rate=CNN_DROPOUT_RATE),
+        MODEL_PATH_CNN
+    )
+
+# --- Pydantic Model Cho Response ---
+class PredictionResponse(BaseModel):
+    model: str
+    ket_qua: str
+    xac_suat_gia: float
+
+# --- Trang Chủ (Frontend) ---
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+# --- API Endpoint Cho Form HTML ---
+@app.post("/predict/", response_class=HTMLResponse)
+async def predict_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    model_type: str = Form("both")
+):
+    if not file.filename.endswith(".wav"):
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "error": "Vui lòng tải lên file WAV."}
+        )
+    audio_data = await file.read()
+    try:
+        mel_spec = audio_to_melspectrogram(audio_data)
+    except HTTPException as e:
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "error": str(e.detail)}
+        )
+    mean = np.mean(mel_spec)
+    std = np.std(mel_spec)
+    mel_spec_normalized = (mel_spec - mean) / (std + NORM_EPSILON)
+    results = []
+    if model_type in ["vit", "both"]:
+        mel_spec_vit = np.stack([mel_spec_normalized]*3, axis=0)
+        mel_spec_tensor = torch.tensor(mel_spec_vit, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            output = vit_model(mel_spec_tensor)
+            prob = torch.sigmoid(output).item()
+            prediction = "Giả" if prob > 0.5 else "Thật"
+            results.append({
+                "model": "ViT",
+                "ket_qua": prediction,
+                "xac_suat_gia": prob
+            })
+    if model_type in ["cnn", "both"]:
+        mel_spec_cnn = np.expand_dims(mel_spec_normalized, axis=0)
+        mel_spec_tensor = torch.tensor(mel_spec_cnn, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            output = cnn_model(mel_spec_tensor)
+            prob = torch.sigmoid(output).item()
+            prediction = "Giả" if prob > 0.5 else "Thật"
+            results.append({
+                "model": "CNN",
+                "ket_qua": prediction,
+                "xac_suat_gia": prob
+            })
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "predictions": results,
+            "filename": file.filename
+        }
+    )
+
+# --- API Endpoint Cho Client ---
+@app.post("/api/predict/", response_model=list[PredictionResponse])
+async def api_predict(file: UploadFile = File(...), model_type: str = "both"):
+    if not file.filename.endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Vui lòng tải lên file WAV.")
+    audio_data = await file.read()
+    try:
+        mel_spec = audio_to_melspectrogram(audio_data)
+    except HTTPException as e:
+        raise e
+    mean = np.mean(mel_spec)
+    std = np.std(mel_spec)
+    mel_spec_normalized = (mel_spec - mean) / (std + NORM_EPSILON)
+    results = []
+    if model_type in ["vit", "both"]:
+        mel_spec_vit = np.stack([mel_spec_normalized]*3, axis=0)
+        mel_spec_tensor = torch.tensor(mel_spec_vit, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            output = vit_model(mel_spec_tensor)
+            prob = torch.sigmoid(output).item()
+            prediction = "Giả" if prob > 0.5 else "Thật"
+            results.append({"model": "ViT", "ket_qua": prediction, "xac_suat_gia": prob})
+    if model_type in ["cnn", "both"]:
+        mel_spec_cnn = np.expand_dims(mel_spec_normalized, axis=0)
+        mel_spec_tensor = torch.tensor(mel_spec_cnn, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            output = cnn_model(mel_spec_tensor)
+            prob = torch.sigmoid(output).item()
+            prediction = "Giả" if prob > 0.5 else "Thật"
+            results.append({"model": "CNN", "ket_qua": prediction, "xac_suat_gia": prob})
+    return results
+
+# --- Phần Huấn Luyện (Chỉ Chạy Nếu IS_TRAINING = True) ---
+if IS_TRAINING:
+    import random
+    import glob
+    import time
+    import torch.optim as optim
+    from torch.utils.data import Dataset, DataLoader
+    from sklearn.model_selection import train_test_split
+    import wandb
+
+    # --- Định Nghĩa Dataset và Training Loop ---
+    class AudioDataset(Dataset):
+        def __init__(self, filepaths, labels, transform_spectrogram_fn, augment=False, is_vit_input=False):
+            self.filepaths = filepaths
+            self.labels = labels
+            self.transform_spectrogram_fn = transform_spectrogram_fn
+            self.augment = augment
+            self.is_vit_input = is_vit_input
+
+        def __len__(self):
+            return len(self.filepaths)
+
+        def __getitem__(self, idx):
+            filepath = self.filepaths[idx]
+            label = self.labels[idx]
+            mel_spec = self.transform_spectrogram_fn(filepath)
+            if mel_spec is None:
+                return None
+            mean = np.mean(mel_spec)
+            std = np.std(mel_spec)
+            mel_spec_normalized = (mel_spec - mean) / (std + NORM_EPSILON)
+            if self.is_vit_input:
+                mel_spec_final = np.stack([mel_spec_normalized]*3, axis=0)
+            else:
+                mel_spec_final = np.expand_dims(mel_spec_normalized, axis=0)
+            mel_spec_tensor = torch.tensor(mel_spec_final, dtype=torch.float32)
+            label_tensor = torch.tensor(label, dtype=torch.float32)
+            return mel_spec_tensor, label_tensor
+
+    def collate_fn_skip_none_vit(batch):
+        batch = list(filter(lambda x: x is not None, batch))
+        if not batch:
+            return torch.empty((0, 3, N_MELS, MAX_FRAMES_SPEC)), torch.empty((0,))
+        return torch.utils.data.dataloader.default_collate(batch)
+
+    def collate_fn_skip_none_cnn(batch):
+        batch = list(filter(lambda x: x is not None, batch))
+        if not batch:
+            return torch.empty((0, 1, N_MELS, MAX_FRAMES_SPEC)), torch.empty((0,))
+        return torch.utils.data.dataloader.default_collate(batch)
+
+    # --- Hàm Huấn Luyện (Rút Gọn) ---
+    def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch_num, num_epochs, model_name="Model"):
+        model.train()
+        running_loss = 0.0
+        correct_predictions = 0
+        total_samples = 0
+        for inputs, labels in train_loader:
+            if inputs.nelement() == 0:
+                continue
+            inputs, labels = inputs.to(device), labels.to(device).unsqueeze(1)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
+            preds = torch.sigmoid(outputs) > 0.5
+            correct_predictions += (preds == labels).sum().item()
+            total_samples += labels.size(0)
+        epoch_loss = running_loss / total_samples if total_samples > 0 else 0
+        epoch_acc = correct_predictions / total_samples if total_samples > 0 else 0
+        return epoch_loss, epoch_acc
+
+    # --- Cấu Hình Huấn Luyện ---
+    REAL_AUDIO_PATH = "path/to/real/audio"
+    FAKE_AUDIO_PATH = "path/to/fake/audio"
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+    EPOCHS = 20
+    WEIGHT_DECAY = 1e-4
+
+    # --- Load Data ---
+    def get_audio_files_and_labels(real_dir, fake_dir):
+        real_files = glob.glob(os.path.join(real_dir, '*.wav'))
+        fake_files = glob.glob(os.path.join(fake_dir, '*.wav'))
+        filepaths = real_files + fake_files
+        labels = [0] * len(real_files) + [1] * len(fake_files)
+        combined = list(zip(filepaths, labels))
+        random.shuffle(combined)
+        filepaths_shuffled, labels_shuffled = zip(*combined) if combined else ([], [])
+        return list(filepaths_shuffled), list(labels_shuffled)
+
+    filepaths_all, labels_all = get_audio_files_and_labels(REAL_AUDIO_PATH, FAKE_AUDIO_PATH)
+    X_train_paths, X_temp_paths, y_train, y_temp = train_test_split(filepaths_all, labels_all, test_size=0.3, random_state=42)
+    X_val_paths, X_test_paths, y_val, y_test = train_test_split(X_temp_paths, y_temp, test_size=0.5, random_state=42)
+
+    # --- DataLoader ---
+    train_dataset_vit = AudioDataset(X_train_paths, y_train, audio_to_melspectrogram, augment=True, is_vit_input=True)
+    val_dataset_vit = AudioDataset(X_val_paths, y_val, audio_to_melspectrogram, augment=False, is_vit_input=True)
+    train_loader_vit = DataLoader(train_dataset_vit, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_skip_none_vit)
+    val_loader_vit = DataLoader(val_dataset_vit, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn_skip_none_vit)
+
+    train_dataset_cnn = AudioDataset(X_train_paths, y_train, audio_to_melspectrogram, augment=True, is_vit_input=False)
+    val_dataset_cnn = AudioDataset(X_val_paths, y_val, audio_to_melspectrogram, augment=False, is_vit_input=False)
+    train_loader_cnn = DataLoader(train_dataset_cnn, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_skip_none_cnn)
+    val_loader_cnn = DataLoader(val_dataset_cnn, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn_skip_none_cnn)
+
+    # --- Huấn Luyện ViT ---
+    vit_model = VisionTransformer(
+        img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=VIT_PATCH_SIZE, in_chans=3, num_classes=1,
+        embed_dim=VIT_EMBED_DIM, depth=VIT_DEPTH, num_heads=VIT_NUM_HEADS, mlp_ratio=VIT_MLP_RATIO,
+        qkv_bias=True, drop_rate=VIT_DROP_RATE, attn_drop_rate=VIT_ATTN_DROP_RATE
+    ).to(DEVICE)
+    optimizer_vit = optim.AdamW(vit_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion_vit = nn.BCEWithLogitsLoss()
+
+    for epoch in range(EPOCHS):
+        train_loss, train_acc = train_one_epoch(vit_model, train_loader_vit, criterion_vit, optimizer_vit, DEVICE, epoch, EPOCHS, "ViT")
+        print(f"Epoch {epoch+1}/{EPOCHS} - ViT - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        torch.save(vit_model.state_dict(), MODEL_PATH_VIT)
+
+    # --- Huấn Luyện CNN ---
+    cnn_model = AudioCNN(num_classes=1, dropout_rate=CNN_DROPOUT_RATE).to(DEVICE)
+    optimizer_cnn = optim.AdamW(cnn_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion_cnn = nn.BCEWithLogitsLoss()
+
+    for epoch in range(EPOCHS):
+        train_loss, train_acc = train_one_epoch(cnn_model, train_loader_cnn, criterion_cnn, optimizer_cnn, DEVICE, epoch, EPOCHS, "CNN")
+        print(f"Epoch {epoch+1}/{EPOCHS} - CNN - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        torch.save(cnn_model.state_dict(), MODEL_PATH_CNN)
+
+===== DIRECTORY TREE =====
+./
+    best_cnn_model_pytorch.pth
+    best_vit_model_pytorch.pth
+    main_deploy.py
+    main_local.ipynb
+    vercel.json
+    static/
+        styles.css
+    templates/
+        index.html
