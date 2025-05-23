@@ -44,8 +44,8 @@ CNN_DROPOUT_RATE = 0.4
 
 # --- ĐƯỜNG DẪN MODEL TỪ GITHUB RELEASES ---
 # !!! QUAN TRỌNG: THAY THẾ CÁC URL SAU BẰNG URL THỰC TẾ TỪ GITHUB RELEASE CỦA BẠN !!!
-MODEL_URL_VIT = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/v1.0.0/best_vit_model_pytorch.pth"
-MODEL_URL_CNN = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/v1.0.0/best_cnn_model_pytorch.pth"
+MODEL_URL_VIT = "https://github.com/namthse182380/audio_ai_detection/releases/download/1.0.0/best_vit_model_pytorch.pth"
+MODEL_URL_CNN = "https://github.com/namthse182380/audio_ai_detection/releases/download/1.0.0/best_cnn_model_pytorch.pth"
 # Ví dụ:
 # MODEL_URL_VIT = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/v1.0.0/best_vit_model_pytorch.pth"
 # MODEL_URL_CNN = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/v1.0.0/best_cnn_model_pytorch.pth"
